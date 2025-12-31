@@ -1,0 +1,122 @@
+# -*- coding: UTF-8 -*-
+
+import os
+import sys
+import pickle
+import logging
+import argparse
+import pandas as pd
+import torch
+
+from helpers import *
+from models.general import *
+from models.sequential import *
+from models.developing import *
+from models.context import *
+from utils import utils
+
+def parse_global_args(parser):
+	parser.add_argument('--gpu', type=str, default='0',
+						help='Set CUDA_VISIBLE_DEVICES, default for CPU only')
+	parser.add_argument('--verbose', type=int, default=logging.INFO,
+						help='Logging Level, 0, 10, ..., 50')
+	parser.add_argument('--log_file', type=str, default='',
+						help='Logging file path')
+	parser.add_argument('--random_seed', type=int, default=2019,
+						help='Random seed of numpy and pytorch')
+	parser.add_argument('--load', type=int, default=0,
+						help='Whether load model and continue to train')
+	parser.add_argument('--train', type=int, default=1,
+						help='To train the model or not.')
+	parser.add_argument('--regenerate', type=int, default=0,
+						help='Whether to regenerate intermediate files')
+	return parser
+
+def main():
+	logging.info('-' * 45 + ' BEGIN: ' + utils.get_time() + ' ' + '-' * 45)
+	exclude = ['check_epoch', 'log_file', 'model_path', 'path', 'pin_memory', 'load', 'regenerate', 'sep', 'train', 'verbose', 'metric', 'test_epoch', 'buffer']
+	logging.info(utils.format_arg_str(args, exclude_lst=exclude))
+
+	# Random seed
+	utils.init_seed(args.random_seed)
+
+	# GPU
+	os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+	args.device = torch.device('cpu')
+	if args.gpu != '' and torch.cuda.is_available():
+		args.device = torch.device('cuda')
+	logging.info('Device: {}'.format(args.device))
+
+	# Read data
+	corpus_path = os.path.join(args.path, args.dataset, 'corpus.pkl')
+	if not args.regenerate and os.path.exists(corpus_path):
+		logging.info('Load corpus from {}'.format(corpus_path))
+		with open(corpus_path, 'rb') as f:
+			corpus = pickle.load(f)
+	else:
+		corpus = reader_name(args)
+		logging.info('Save corpus to {}'.format(corpus_path))
+		utils.check_dir(corpus_path)
+		with open(corpus_path, 'wb') as f:
+			pickle.dump(corpus, f)
+
+	# Define model
+	model = model_name(args, corpus).to(args.device)
+	logging.info('#params: {}'.format(model.count_variables()))
+	logging.info(model)
+
+	# Run model
+	data_dict = dict()
+	for phase in ['train', 'dev', 'test']:
+		data_dict[phase] = model_name.Dataset(model, corpus, phase)
+		data_dict[phase].prepare()
+
+	runner = runner_name(args)
+	if args.load > 0:
+		model.load_model()
+	if args.train > 0:
+		runner.train(data_dict)
+	
+	# Evaluate on test set
+	eval_res = runner.print_res(data_dict['test'])
+	logging.info(os.linesep + 'Test Results ' + eval_res + os.linesep)
+	logging.info('-' * 45 + ' END: ' + utils.get_time() + ' ' + '-' * 45)
+
+if __name__ == '__main__':
+	init_parser = argparse.ArgumentParser(description='Model')
+	init_parser.add_argument('--model_name', type=str, default='T_CE', help='Choose a model to run.')
+	init_args, init_extras = init_parser.parse_known_args()
+	
+	# Dynamically load model, reader, runner
+	try:
+		model_name = eval(init_args.model_name)
+	except NameError:
+		raise NameError(f"Model '{init_args.model_name}' not found. Make sure it is imported in main.py")
+		
+	reader_name = eval(model_name.reader)
+	runner_name = eval(model_name.runner)
+
+	# Args
+	parser = argparse.ArgumentParser(description='')
+	parser = parse_global_args(parser)
+	parser = reader_name.parse_data_args(parser)
+	parser = runner_name.parse_runner_args(parser)
+	parser = model_name.parse_model_args(parser)
+	args, extras = parser.parse_known_args()
+
+	# Logging
+	log_args = [init_args.model_name, args.dataset, str(args.epoch)]
+	for arg in ['lr', 'l2'] + model_name.extra_log_args:
+		log_args.append(arg + '=' + str(getattr(args, arg)))
+	log_file_name = '__'.join(log_args).replace(' ', '__')
+	if args.log_file == '':
+		args.log_file = '../log/{}/{}.txt'.format(init_args.model_name, log_file_name)
+	if args.model_path == '':
+		args.model_path = '../model/{}/{}.pt'.format(init_args.model_name, log_file_name)
+
+	utils.check_dir(args.log_file)
+	logging.basicConfig(filename=args.log_file, level=args.verbose)
+	logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+	logging.info(init_args)
+
+	main()
